@@ -182,7 +182,7 @@ class Qwen3Model(nn.Module):
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 

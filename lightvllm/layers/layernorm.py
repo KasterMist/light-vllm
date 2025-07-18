@@ -13,7 +13,8 @@ class RMSNorm(nn.Module):
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         origin_dtype = x.dtype
         x = x.to(torch.float32)
-        var = x.pow(2).mean(-1, True) # 计算方差，-1表示最后一个维度，True表示保持维度
+        var = x.pow(2).mean(-1, True) # Calculate variance, -1 means last dimension, True means keep dimensions
+        x.mul_(torch.rsqrt(var + self.eps))  # Apply RMS normalization
         x = x.to(origin_dtype).mul_(self.weight)
         return x
 
@@ -21,7 +22,7 @@ class RMSNorm(nn.Module):
     def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         origin_dtype = x.dtype
         x = x.to(torch.float32).add_(residual.to(torch.float32))
-        residual = x.to(origin_dtype) # 将x的当前值（残差连接后的结果）保存为新的residual, 这个residual将作为下一层的输入
+        residual = x.to(origin_dtype) # Save current value of x (result after residual connection) as new residual, this residual will be input to next layer
         var = x.pow(2).mean(-1, True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(origin_dtype).mul_(self.weight)

@@ -9,8 +9,8 @@ class SiluAndMul(nn.Module):
 
     @torch.compile
     def forward(self, x: torch.Tensor):
-        # split x into two tensors along the last dimension
-        # for instance, if x is [1, 2, 3, 4], x.chunk(2, -1) will return [1, 2] and [3, 4]
+        # Split x into two tensors along the last dimension
+        # For instance, if x is [1, 2, 3, 4], x.chunk(2, -1) will return [1, 2] and [3, 4]
         x, y = x.chunk(2, -1) 
-        # silu is a activation function that is defined as x * sigmoid(x)
+        # SiLU is an activation function that is defined as x * sigmoid(x)
         return F.silu(x) * y

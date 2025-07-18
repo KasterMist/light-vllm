@@ -1,16 +1,18 @@
 import os
+from dataclasses import fields
 from transformers import AutoTokenizer
+from lightvllm.llm import LLM
 from lightvllm.sampling_params import SamplingParams
 from lightvllm.engine.sequence import Sequence
 from lightvllm.engine.scheduler import Scheduler
 from lightvllm.config import Config
-from dataclasses import fields
 from lightvllm.utils.loader import load_model
+
 
 if __name__ == "__main__":
     path = os.path.expanduser("~/.cache/huggingface/hub/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained(path)
-
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
     sampling_params = SamplingParams(temperature=0.8, max_tokens=128)
 
     prompts = [
@@ -27,22 +29,11 @@ if __name__ == "__main__":
         )
         for prompt in prompts
     ]
-    kwargs = {
-        "enforce_eager": True,
-        "tensor_parallel_size": 1
-    }
 
-    config_fields = {field.name for field in fields(Config)}
-    config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-    config = Config(path, **config_kwargs)
-    print("config:", config)
-    # print(config_fields)
-    # print(config_kwargs)
-    scheduler = Scheduler(config)
-    print(prompts)
-    prompt_encode = tokenizer.encode(prompts[0])
-    seq_1 = Sequence(prompt_encode, sampling_params)
-    print(seq_1.token_ids)
-    scheduler.add(seq_1)
-    print(scheduler.waiting)
+    outputs = llm.generate(prompts, sampling_params)
+
+    for prompt, output in zip(prompts, outputs):
+        print("\n")
+        print(f"Prompt: {prompt!r}")
+        print(f"Completion: {output['text']!r}")
 

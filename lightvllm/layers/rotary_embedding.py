@@ -7,38 +7,38 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor) -> torch.Tensor:
     """
-    应用旋转位置编码到输入张量
+    Apply rotary position encoding to input tensor
     
     Args:
-        x: 输入张量，形状为 [..., head_size]
-        cos: 余弦值，形状为 [seq_len, rotary_dim//2]
-        sin: 正弦值，形状为 [seq_len, rotary_dim//2]
+        x: Input tensor, shape [..., head_size]
+        cos: Cosine values, shape [seq_len, rotary_dim//2]
+        sin: Sine values, shape [seq_len, rotary_dim//2]
     
     Returns:
-        应用了旋转位置编码的张量
+        Tensor with rotary position encoding applied
     """
-    # 扩展维度以便广播
-    cos = cos.unsqueeze(2)  # [seq_len, rotary_dim//2, 1]
-    sin = sin.unsqueeze(-2)  # [seq_len, 1, rotary_dim//2]
+    # Expand dimensions for broadcasting
+    cos = cos.unsqueeze(-2)  # [seq_len, rotary_dim//2, 1]
+    sin = sin.unsqueeze(-2)  # [seq_len, rotary_dim//2, 1]
     
-    # 将输入转换为float32以确保精度，然后分成两半
+    # Convert input to float32 for precision, then split into two halves
     x1, x2 = torch.chunk(x.to(torch.float32), 2, -1)
     
-    # 应用旋转变换: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
-    # cos 和 sin 会自行广播成 [seq_len, head_size, rotary_dim//2]
+    # Apply rotation transform: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
+    # cos and sin will broadcast to [seq_len, head_size, rotary_dim//2]
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     
-    # 将结果拼接并转换回原始数据类型
+    # Concatenate results and convert back to original data type
     return torch.cat((y1, y2), -1).to(x.dtype)
 
 
 class RotaryEmbedding(nn.Module):
     """
-    旋转位置编码模块
+    Rotary position encoding module
     
-    这个模块实现了RoPE (Rotary Position Embedding)，
-    通过将token的位置信息编码到注意力机制的query和key中
+    This module implements RoPE (Rotary Position Embedding),
+    encoding token position information into the query and key of attention mechanism
     """
 
     def __init__(self, head_size: int,
@@ -46,33 +46,33 @@ class RotaryEmbedding(nn.Module):
                 max_position_embeddings: int,
                 base: float):
         """
-        初始化旋转位置编码
+        Initialize rotary position encoding
         
         Args:
-            head_size: 注意力头的维度
-            rotary_dim: 旋转编码的维度，通常等于head_size
-            max_position_embeddings: 最大位置数量
-            base: 频率基数，用于计算频率
+            head_size: Attention head dimension
+            rotary_dim: Rotary encoding dimension, usually equals head_size
+            max_position_embeddings: Maximum number of positions
+            base: Frequency base for calculating frequencies
         """
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size  # 确保旋转维度等于头维度
+        assert rotary_dim == head_size  # Ensure rotary dimension equals head dimension
         
-        # 计算逆频率: 1 / (base^(2i/d)) for i in [0, d/2)
+        # Calculate inverse frequencies: 1 / (base^(2i/d)) for i in [0, d/2)
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         
-        # 位置序列: [0, 1, 2, ..., max_position_embeddings-1]
+        # Position sequence: [0, 1, 2, ..., max_position_embeddings-1]
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         
-        # 计算频率: outer product of positions and inverse frequencies
-        # 结果形状: [max_position_embeddings, rotary_dim//2]
+        # Calculate frequencies: outer product of positions and inverse frequencies
+        # Result shape: [max_position_embeddings, rotary_dim//2]
         freqs = torch.einsum("i, j -> ij", t, inv_freq)
         
-        # 计算余弦和正弦值
+        # Calculate cosine and sine values
         cos = freqs.cos()  # [max_position_embeddings, rotary_dim//2]
         sin = freqs.sin()  # [max_position_embeddings, rotary_dim//2]
         
-        # 将cos和sin拼接并缓存
+        # Concatenate cos and sin and cache
         cache = torch.cat((cos, sin), -1)  # [max_position_embeddings, rotary_dim]
         self.register_buffer("cos_sin_cache", cache, False)
 
@@ -81,31 +81,31 @@ class RotaryEmbedding(nn.Module):
                 query: torch.Tensor,
                 key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:   
         """
-        前向传播，对query和key应用旋转位置编码
+        Forward pass, apply rotary position encoding to query and key
         
         Args:
-            positions: 位置索引，形状为 [num_tokens]
-            query: 查询张量，形状为 [num_tokens, num_heads, head_size]
-            key: 键张量，形状为 [num_tokens, num_heads, head_size]
+            positions: Position indices, shape [num_tokens]
+            query: Query tensor, shape [num_tokens, num_heads, head_size]
+            key: Key tensor, shape [num_tokens, num_heads, head_size]
         
         Returns:
-            应用了旋转位置编码的query和key
+            Query and key with rotary position encoding applied
         """
         num_tokens = positions.size(0)
         
-        # 根据位置索引获取对应的cos和sin值
+        # Get corresponding cos and sin values based on position indices
         cos_sin = self.cos_sin_cache[positions]  # [num_tokens, rotary_dim]
-        cos, sin = cos_sin.chunk(2, -1)  # 分别获取cos和sin部分
+        cos, sin = cos_sin.chunk(2, -1)  # Get cos and sin parts separately
         
-        # 对query应用旋转位置编码
+        # Apply rotary position encoding to query
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)  # 重塑为 [num_tokens, num_heads, head_size]
-        query = apply_rotary_emb(query, cos, sin).view(query_shape)  # 应用RoPE并恢复原始形状
+        query = query.view(num_tokens, -1, self.head_size)  # Reshape to [num_tokens, num_heads, head_size]
+        query = apply_rotary_emb(query, cos, sin).view(query_shape)  # Apply RoPE and restore original shape
         
-        # 对key应用旋转位置编码
+        # Apply rotary position encoding to key
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)  # 重塑为 [num_tokens, num_heads, head_size]
-        key = apply_rotary_emb(key, cos, sin).view(key_shape)  # 应用RoPE并恢复原始形状
+        key = key.view(num_tokens, -1, self.head_size)  # Reshape to [num_tokens, num_heads, head_size]
+        key = apply_rotary_emb(key, cos, sin).view(key_shape)  # Apply RoPE and restore original shape
         
         return query, key
 
@@ -119,20 +119,20 @@ def get_rope(
     rope_scaling: dict | None = None
     ):
     """
-    获取旋转位置编码实例的工厂函数
+    Factory function to get rotary position encoding instance
     
-    使用LRU缓存来避免重复创建相同的RoPE实例
+    Uses LRU cache to avoid repeatedly creating the same RoPE instance
     
     Args:
-        head_size: 注意力头的维度
-        rotary_dim: 旋转编码的维度
-        max_position: 最大位置数量
-        base: 频率基数
-        rope_scaling: 旋转缩放参数（当前未使用）
+        head_size: Attention head dimension
+        rotary_dim: Rotary encoding dimension
+        max_position: Maximum number of positions
+        base: Frequency base
+        rope_scaling: Rotary scaling parameters (currently unused)
     
     Returns:
-        RotaryEmbedding实例
+        RotaryEmbedding instance
     """
-    assert rope_scaling is None  # 当前实现不支持rope_scaling
+    assert rope_scaling is None  # Current implementation doesn't support rope_scaling
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb
