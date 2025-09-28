@@ -1,1 +1,7 @@
-__pycache__/
+**/__pycache__/
+**/.mypy_cache/
+/download_models/
+/.github/
+**/lightvllm.egg-info/
+/my_weight/
+/.vscode/
