@@ -10,7 +10,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos   # end of sequence token
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
-        self.waiting: deque[Sequence] = deque()
+        self.waiting: deque[Sequence] = deque()  # sequences will be allocated to the waiting at first
         self.running: deque[Sequence] = deque()
 
     def is_finished(self):
@@ -29,11 +29,11 @@ class Scheduler:
         # prefill
         # pop sequences from waiting queue. Make sure the number of sequences is less than max_num_seqs.
         # when the num_seqs (number of poped seqs in waiting queue) is enough, break the loop
-        scheduled_seqs = []
-        num_seqs = 0
-        num_batched_tokens = 0
+        scheduled_seqs = [] # sequences scheduled in the current step
+        num_seqs = 0    # number of sequences in the current batch
+        num_batched_tokens = 0 # total number of tokens in the current batch
         while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
+            seq = self.waiting[0] # get the first sequence in the waiting queue
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
@@ -42,7 +42,7 @@ class Scheduler:
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)
-            scheduled_seqs.append(seq)
+            scheduled_seqs.append(seq) # these sequences are executed in prefilling work
         if scheduled_seqs:
             return scheduled_seqs, True
         

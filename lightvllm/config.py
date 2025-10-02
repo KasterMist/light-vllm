@@ -11,9 +11,9 @@ class Config:
     max_model_len: int = 4096                   # max length of a sequence
     gpu_memory_utilization: float = 0.9         # gpu memory utilization
     tensor_parallel_size: int = 1               # tensor parallel size
-    enforce_eager: bool = False                 # enforce eager mode
+    enforce_eager: bool = False                 # whether to disable CUDA graphs and use the eager mode
     hf_config: AutoConfig | None = None         # huggingface config
-    eos: int = -1                               # end of sequence token
+    eos: int = -1                               # end of sequence token ID (default -1 means not set)
     kvcache_block_size: int = 256               # kvcache block size
     num_kvcache_blocks: int = -1                # number of kvcache blocks
 
