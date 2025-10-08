@@ -79,7 +79,7 @@ class Scheduler:
             # 如果满足条件，则正式将该序列加入调度列表
             num_seqs += 1
             self.block_manager.allocate(seq)  # 为序列分配KV缓存块
-            num_batched_tokens += len(seq) - seq.num_cached_tokens # 累加token数（考虑前缀缓存）
+            num_batched_tokens += len(seq) - seq.num_cached_tokens # 累加token数（考虑前缀缓存,当前seq的num_cached_tokens不会被记录在内）
             seq.status = SequenceStatus.RUNNING  # 更新序列状态为运行中
             self.waiting.popleft()  # 从等待队列中移除
             self.running.append(seq)  # 添加到运行队列

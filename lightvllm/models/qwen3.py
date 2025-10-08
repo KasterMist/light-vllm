@@ -13,8 +13,11 @@ from lightvllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 class Qwen3Attention(nn.Module):
     """
-    Multi-head attention module for Qwen3 model with support for grouped-query attention (GQA).
-    Implements parallel attention computation with tensor parallelism support.
+    Qwen3 模型的注意力模块。
+    
+    实现了分组查询注意力（GQA）并支持张量并行。
+    与标准注意力机制的主要区别在于，它在应用旋转位置编码（RoPE）之前，
+    对 Query 和 Key 向量进行了 RMS 归一化。
     """
 
     def __init__(
@@ -30,20 +33,23 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        # Tensor parallelism setup
-        tp_size = dist.get_world_size()
+        # --- 张量并行设置 ---
+        tp_size = dist.get_world_size()  # 获取张量并行的大小（即GPU数量）
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        self.num_heads = self.total_num_heads // tp_size  # 计算当前GPU应处理的查询头（Q）数量
+
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.num_kv_heads = self.total_num_kv_heads // tp_size  # 计算当前GPU应处理的键/值（KV）头数量
 
-        # Parallel linear layers for QKV projection
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim  # 当前GPU上所有Q头的总维度
+        self.kv_size = self.num_kv_heads * self.head_dim # 当前GPU上所有KV头的总维度
+        self.scaling = self.head_dim ** -0.5  # Attention-is-all-you-need中的缩放因子
+
+        # --- 层定义 ---
+        # QKV的并行线性层。它将Q、K、V的投影矩阵合并，并沿列（hidden_size）切分，分发到不同GPU上。
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -51,13 +57,14 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        # Output projection layer
+        # 输出投影层。它将多头注意力的结果合并，并进行线性变换。
+        # 它的权重矩阵是按行切分的，接收来自所有GPU的部分结果，在All-Reduce后得到最终输出。
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
         )
-        # Rotary positional embeddings
+        # 旋转位置编码（Rotary Positional Embeddings）
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -65,14 +72,14 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        # Core attention computation
+        # 核心的注意力计算层（PagedAttention实现）
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
         )
-        # Query and key normalization layers
+        # Qwen3特有的：对Query和Key进行RMSNorm
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -81,31 +88,39 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Project input to QKV
-        qkv = self.qkv_proj(hidden_states)
+        # hidden_states: [num_tokens, hidden_size]
+        
+        # 1. QKV投影
+        qkv = self.qkv_proj(hidden_states)  # -> [num_tokens, q_size + 2 * kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # q: [num_tokens, q_size], k: [num_tokens, kv_size], v: [num_tokens, kv_size]
         
-        # Apply normalization to query and key
-        q_by_head = q.view(-1, self.num_heads, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
+        # 2. Q/K 归一化 (Qwen3 特有)
+        # 为了对每个头进行归一化，需要先改变形状
+        q_by_head = q.view(-1, self.num_heads, self.head_dim)    # -> [num_tokens, num_heads, head_dim]
+        q_by_head = self.q_norm(q_by_head)                      # 形状不变
+        q = q_by_head.view(q.shape)                             # -> [num_tokens, q_size]
         
-        # Apply rotary positional embeddings
-        q, k = self.rotary_emb(positions, q, k)
+        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim) # -> [num_tokens, num_kv_heads, head_dim]
+        k_by_head = self.k_norm(k_by_head)                      # 形状不变
+        k = k_by_head.view(k.shape)                             # -> [num_tokens, kv_size]
         
-        # Compute attention
-        o = self.attn(q, k, v)
-        output = self.o_proj(o)
+        # 3. 应用旋转位置编码
+        q, k = self.rotary_emb(positions, q, k) # 形状不变
+        
+        # 4. 计算注意力
+        # self.attn 内部会处理KV缓存的存取
+        o = self.attn(q, k, v)  # -> [num_tokens, num_heads * head_dim]
+        
+        # 5. 输出投影
+        output = self.o_proj(o) # -> [num_tokens, hidden_size]
         return output
 
 
 class Qwen3MLP(nn.Module):
     """
-    Multi-layer perceptron (MLP) module for Qwen3 model.
-    Implements SwiGLU activation with parallel computation support.
+    Qwen3模型中的多层感知机（MLP）模块。
+    它使用了SwiGLU激活函数，并通过合并gate和up投影来优化计算效率。
     """
 
     def __init__(
@@ -115,36 +130,44 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        # Gate and up projection layers (merged for efficiency)
+        # MergedColumnParallelLinear将两个并行的列并行线性层合并为一次矩阵乘法。
+        # 这里，它同时计算gate和up的投影。
+        # 输入: [num_tokens, hidden_size]
+        # 输出: [num_tokens, 2 * intermediate_size]
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        # Down projection layer
+        # RowParallelLinear用于将结果投影回hidden_size
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
         )
-        assert hidden_act == "silu"
-        # SwiGLU activation function
+        assert hidden_act == "silu", "Qwen3 MLP只支持silu激活函数"
+        # SiluAndMul实现了SwiGLU激活函数: SiLU(gate) * up
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        # Apply gate and up projections
-        gate_up = self.gate_up_proj(x)
-        # Apply SwiGLU activation
-        x = self.act_fn(gate_up)
-        # Apply down projection
-        x = self.down_proj(x)
+        # x: [num_tokens, hidden_size]
+        
+        # 1. Gate和Up投影
+        gate_up = self.gate_up_proj(x) # -> [num_tokens, 2 * intermediate_size]
+        
+        # 2. SwiGLU激活
+        # act_fn会将输入张量在最后一个维度上劈开，一半做SiLU，一半保持原样，然后相乘。
+        x = self.act_fn(gate_up)       # -> [num_tokens, intermediate_size]
+        
+        # 3. Down投影
+        x = self.down_proj(x)          # -> [num_tokens, hidden_size]
         return x
 
 
 class Qwen3DecoderLayer(nn.Module):
     """
-    Single decoder layer for Qwen3 model.
-    Contains self-attention and MLP blocks with residual connections and layer normalization.
+    Qwen3模型的单个解码器层。
+    它遵循标准的Pre-Norm结构，包含一个自注意力块和一个MLP块。
     """
 
     def __init__(
@@ -152,7 +175,7 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config
     ):
         super().__init__()
-        # Self-attention block
+        # 自注意力模块
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -164,14 +187,15 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None)
         )
-        # MLP block
+        # MLP模块
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act
         )
-        # Layer normalization layers
+        # 输入层归一化
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        # 注意力后的层归一化
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -180,26 +204,36 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None
     ):
-        # Pre-attention normalization and residual connection
+        # hidden_states: [num_tokens, hidden_size]
+        # residual: [num_tokens, hidden_size] or None
+        
+        # 1. 输入层归一化 (Pre-Norm) 和残差连接
+        # light-vllm中的RMSNorm实现可以同时返回归一化后的输出和新的残差，以优化计算
         if residual is None:
+            # 第一次迭代，残差就是输入本身
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # 后续迭代，将上一层的输出与更早的残差相加
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         
-        # Self-attention
+        # 2. 自注意力计算
         hidden_states = self.self_attn(positions, hidden_states)
         
-        # Post-attention normalization and MLP
+        # 3. 注意力后的层归一化和残差连接
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        # 4. MLP计算
         hidden_states = self.mlp(hidden_states)
+        
+        # 返回当前层的输出和用于下一层计算的残差
         return hidden_states, residual
 
 
 class Qwen3Model(nn.Module):
     """
-    Core Qwen3 model without language modeling head.
-    Contains token embeddings, decoder layers, and final normalization.
+    Qwen3模型的核心部分，不包含语言模型头部（LM Head）。
+    它由词嵌入层、多个解码器层和最后的归一化层组成。
     """
 
     def __init__(
@@ -207,16 +241,16 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config
     ):
         super().__init__()
-        # Token embedding layer with vocabulary parallelism
+        # 词嵌入层，支持词汇表并行（当tp_size > 1时，词汇表会被切分）
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
-        # Stack of decoder layers
+        # 堆叠的解码器层
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)],
         )
-        # Final layer normalization
+        # 最后的归一化层
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
@@ -224,26 +258,31 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor
     ):
-        # Token embedding
-        hidden_states = self.embed_tokens(input_ids)
+        # input_ids: [num_tokens]
+        # positions: [num_tokens]
+        
+        # 1. 词嵌入
+        hidden_states = self.embed_tokens(input_ids) # -> [num_tokens, hidden_size]
         residual = None
         
-        # Process through decoder layers
+        # 2. 逐层通过解码器
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
         
-        # Final normalization
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # 3. 最后的归一化
+        hidden_states, _ = self.norm(hidden_states, residual) # -> [num_tokens, hidden_size]
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
     """
-    Complete Qwen3 model for causal language modeling.
-    Includes the core model and language modeling head for text generation.
+    用于因果语言建模的完整Qwen3模型。
+    它在Qwen3Model的基础上增加了用于生成下一个token的语言模型头部。
     """
     
-    # Mapping for packed modules (used for model loading/saving)
+    # 这个映射表告诉模型加载器（loader.py）如何处理权重名称。
+    # 例如，它指示加载器将文件中名为 'q_proj' 的权重加载到模型中 'qkv_proj' 参数的 'q' 部分。
+    # 'gate_proj' 和 'up_proj' 也是类似地被合并到 'gate_up_proj' 中。
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -257,12 +296,12 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ):
         super().__init__()
-        # Core Qwen3 model
+        # 核心模型
         self.model = Qwen3Model(config)
-        # Language modeling head with vocabulary parallelism
+        # 语言模型头部，用于将模型输出映射到词汇表上
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         
-        # Weight tying between embedding and output layers
+        # 如果配置要求，则绑定词嵌入和输出层的权重（权重共享）
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         
@@ -271,7 +310,7 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor
     ):
-        # Forward pass through the model
+        # 前向传播，获取最后一层的隐藏状态
         hidden_states = self.model(input_ids, positions)
         return hidden_states
     
@@ -279,7 +318,8 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor
     ):
-        # Compute logits for language modeling
-        logits = self.lm_head(hidden_states)
+        # hidden_states: [num_tokens, hidden_size]
+        # 计算logits
+        logits = self.lm_head(hidden_states) # -> [num_tokens, vocab_size]
         return logits
 

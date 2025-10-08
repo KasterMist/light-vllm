@@ -59,7 +59,8 @@ class Sequence:
         self.block_table: list[int] = []
         # 从采样参数中提取的配置
         self.temperature = sampling_params.temperature
-        self.max_tokens = sampling_params.max_tokens
+        # TODO: 这个好像是在prompt之后生成的最大token数量, 默认是128, 可后续修改，需要确认
+        self.max_tokens = sampling_params.max_tokens 
         self.ignore_eos = sampling_params.ignore_eos
 
     def __len__(self):

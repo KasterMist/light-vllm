@@ -1,9 +1,9 @@
 """
-Embedding layer and language model head module - supporting vocabulary parallel embedding and output layers
+Embedding层和语言模型头模块 - 支持词汇并行嵌入和输出层
 
-This module provides two main classes:
-1. VocabParallelEmbedding: Vocabulary parallel embedding layer that partitions vocabulary across different GPUs
-2. ParallelLMHead: Parallel language model head for generating logits for the next token
+该模块提供了两个主要类:
+1. VocabParallelEmbedding: 词汇并行嵌入层，将词汇表分区到不同的GPU上
+2. ParallelLMHead: 并行的语言模型头，用于生成下一个token的logits
 
 """
 
@@ -17,18 +17,18 @@ from lightvllm.utils.context import get_context
 
 class VocabParallelEmbedding(nn.Module):
     """
-    Vocabulary parallel embedding layer
+    词汇并行嵌入层
     
-    Partitions the vocabulary across different GPUs, where each GPU only stores embedding vectors for a portion of the vocabulary.
-    This design can:
-    - Reduce memory usage on each GPU
-    - Support larger vocabularies
-    - Reduce computation during inference
+    将词汇表分区到不同的GPU上，每个GPU只存储词汇表一部分的嵌入向量。
+    这种设计可以:
+    - 减少每个GPU上的内存使用
+    - 支持更大的词汇表
+    - 减少推理时的计算量
     
-    Features:
-    - Each GPU only stores embeddings for a portion of the vocabulary
-    - Forward pass requires handling vocabulary ID mapping
-    - Uses all-reduce operations to merge results from different GPUs
+    特性:
+    - 每个GPU只存储一部分词汇表的嵌入
+    - 前向传播需要处理词汇ID的映射
+    - 使用all-reduce操作合并不同GPU的结果
     """
 
     def __init__(
@@ -37,69 +37,78 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        # Get current process rank and total size in distributed group, tp -> tensor parallelism
+        # 获取当前进程在分布式组中的rank和总大小, tp -> tensor parallelism (张量并行)
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         
-        # Ensure vocabulary size is divisible by number of GPUs
+        # 确保词汇表大小可以被GPU数量整除
         assert num_embeddings % self.tp_size == 0
         
         self.num_embeddings = num_embeddings
-        # Number of vocabulary items each GPU is responsible for
+        # 每个GPU负责的词汇数量
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         
-        # Vocabulary ID range that current GPU is responsible for
+        # 当前GPU负责的词汇ID范围
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
         
-        # Create embedding weight matrix, only containing vocabulary items current GPU is responsible for
+        # 创建嵌入权重矩阵，只包含当前GPU负责的词汇
+        # 维度: [num_embeddings_per_partition, embedding_dim]
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
-        # Set weight loader (for loading weights from checkpoints)
+        # 设置权重加载器 (用于从checkpoint加载权重)
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         """
-        Weight loader: Extract the portion corresponding to current GPU from complete vocabulary table
+        权重加载器: 从完整的词汇表中抽取出当前GPU对应的部分
         
         Args:
-            param: Parameter to update (current GPU's embedding weights)
-            loaded_weight: Complete vocabulary table weights loaded from checkpoint
+            param: 需要更新的参数 (当前GPU的嵌入权重)
+            loaded_weight: 从checkpoint加载的完整词汇表权重
         """
         param_data = param.data
-        # Get vocabulary count for current partition
+        # 获取当前分区的词汇数量
         shard_size = param_data.size(0)
-        # Calculate starting position of current partition in complete vocabulary table
+        # 计算当前分区在完整词汇表中的起始位置
         start_idx = self.tp_rank * shard_size
-        # Extract corresponding portion from complete weights
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size) # narrow crops tensor along specified dimension torch.narrow(dim, start, length)
-        # Ensure sizes match
+        # 从完整权重中抽取出对应的部分
+        # narrow: 沿着指定维度裁剪张量 torch.narrow(dim, start, length)
+        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        # 确保尺寸匹配
         assert param_data.size() == loaded_weight.size()
 
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
         """
-        Forward pass: Convert token IDs to embedding vectors
+        前向传播: 将token ID转换为嵌入向量
         
         Args:
-            x: Input token ID tensor, shape [batch_size, seq_len]
+            x: 输入的token ID张量, 维度: [batch_size, seq_len]
             
         Returns:
-            Embedding vector tensor, shape [batch_size, seq_len, embedding_dim]
+            嵌入向量张量, 维度: [batch_size, seq_len, embedding_dim]
         """
         if self.tp_size > 1:
-            # Create mask to identify which tokens belong to vocabulary range current GPU is responsible for
+            # 创建掩码，用于识别哪些token属于当前GPU负责的词汇范围
+            # mask 维度: [batch_size, seq_len], bool类型
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            # Map vocabulary IDs to current GPU's local indices
+            # 将词汇ID映射到当前GPU的本地索引
+            # 不在范围内的token ID会被置为0，但由于mask的存在，它们在后续计算中会被忽略
             x = mask * (x - self.vocab_start_idx)
         
-        # Perform embedding lookup
+        # 执行嵌入查找
+        # y 维度: [batch_size, seq_len, embedding_dim]
         y = F.embedding(x, self.weight)
         
         if self.tp_size > 1:
-            # Extend mask to embedding dimensions
-            y = mask.unsqueeze(1) * y
-            # Use all-reduce operation to merge results from all GPUs
+            # 将掩码扩展到嵌入维度
+            # mask.unsqueeze(-1) 维度: [batch_size, seq_len, 1]
+            # y 维度: [batch_size, seq_len, embedding_dim]
+            # 通过广播，将不在当前GPU范围内的token的嵌入向量置为0
+            y = y * mask.unsqueeze(-1)
+            # 使用all-reduce操作合并所有GPU的结果
+            # 每个GPU上的y张量（部分结果）会按元素相加，最终所有GPU都得到完整的、合并后的y
             dist.all_reduce(y)
         
         return y
@@ -107,15 +116,15 @@ class VocabParallelEmbedding(nn.Module):
 
 class ParallelLMHead(VocabParallelEmbedding):
     """
-    Parallel language model head
+    并行的语言模型头
     
-    Inherits from VocabParallelEmbedding, specifically for generating logits for the next token.
-    During inference, usually only logits for the last token are needed, so optimization is supported.
+    继承自VocabParallelEmbedding，专门用于生成下一个token的logits。
+    在推理时，通常只需要最后一个token的logits，因此支持优化。
     
-    Features:
-    - Supports bias terms
-    - Only computes logits for the last token during prefill phase
-    - Uses gather operation to collect logits from all GPUs
+    特性:
+    - 支持偏置项 (bias)
+    - 在prefill阶段只计算最后一个token的logits
+    - 使用gather操作从所有GPU收集logits
     """
 
     def __init__(
@@ -126,7 +135,8 @@ class ParallelLMHead(VocabParallelEmbedding):
     ):
         super().__init__(num_embeddings, embedding_dim)
         if bias:
-            # Create bias parameter, only containing vocabulary items current GPU is responsible for
+            # 创建偏置参数，只包含当前GPU负责的词汇
+            # 维度: [num_embeddings_per_partition]
             self.bias = nn.Parameter(torch.empty(self.num_embeddings_per_partition))
             self.bias.weight_loader = self.weight_loader
         else:
@@ -134,44 +144,54 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         """
-        Forward pass: Compute logits for next token prediction
+        前向传播: 计算用于下一个token预测的logits
         
         Args:
-            x: Input hidden state tensor, shape [batch_size, seq_len, hidden_dim]
+            x: 输入的隐藏状态张量, 维度: [num_tokens, hidden_dim] or [batch_size, seq_len, hidden_dim]
             
         Returns:
-            Logits tensor, shape [batch_size, vocab_size] or [batch_size, seq_len, vocab_size]
+            Logits张量。
+            如果 tp_size > 1 且 tp_rank != 0, 返回 None。
+            否则, 返回维度为 [num_tokens, vocab_size] 的张量。
         """
-        # Get current context information
+        # 获取当前上下文信息
         context = get_context()
         
+        # x 初始维度: [total_tokens, hidden_dim]
         if context.is_prefill:
-            # During prefill phase, only compute logits for the last token of each sequence
-            # cu_seqlens_q[1:] - 1 gives the last position of each sequence
+            # 在prefill阶段，只计算每个序列最后一个token的logits
+            # cu_seqlens_q 是一维累积序列长度，如 [0, 5, 12], 表示第一个序列长度为5，第二个为7
+            # cu_seqlens_q[1:] - 1 得到每个序列最后一个token在 total_tokens 维度上的索引
             last_indices = context.cu_seqlens_q[1:] - 1
+            # x 维度变为: [batch_size, hidden_dim]
             x = x[last_indices].contiguous()
+        # 在decode阶段, x的维度已经是 [batch_size, hidden_dim] (因为每个请求只解码一个token), 所以无需操作
         
-        # Compute logits: x @ weight.T + bias
+        # 计算logits: x @ weight.T + bias
+        # x 维度: [N, hidden_dim], self.weight 维度: [vocab_partition_size, hidden_dim]
+        # logits 维度: [N, vocab_partition_size]
         logits = F.linear(x, self.weight, self.bias)
         
         if self.tp_size > 1:
-            # Gather logits from all GPUs
+            # 从所有GPU收集logits
             if self.tp_rank == 0:
-                # rank 0 creates receive buffer
+                # rank 0 创建接收缓冲区, 列表长度为tp_size
+                # 每个元素的维度与logits相同: [N, vocab_partition_size]
                 all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)]
             else:
                 all_logits = None
-            # all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            # Use gather operation to collect logits from all GPUs to rank 0
+            
+            # 使用gather操作将所有GPU的logits收集到rank 0
+            # dist.gather(tensor_to_send, list_to_receive_on_rank_0, destination_rank)
             dist.gather(logits, all_logits, 0)
             
-            # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
-
             if self.tp_rank == 0:
-                # Concatenate logits from all GPUs on rank 0
+                # 在rank 0上，将所有GPU的logits沿词汇表维度拼接起来
+                # all_logits 是一个list of tensor, 每个tensor维度是 [N, vocab_partition_size]
+                # 拼接后 logits 维度: [N, vocab_partition_size * tp_size] = [N, vocab_size]
                 logits = torch.cat(all_logits, -1)
             else:
-                # Other GPUs return None
+                # 其他GPU返回None
                 logits = None
         
         return logits

@@ -112,25 +112,30 @@ class BlockManager:
         为一个序列分配所需的KV缓存块。
         这个函数只在序列第一次被调度（prefill阶段）时调用一次。
         它会尝试利用前缀缓存来复用已有的块。
+        TODO: 避免prefill阶段compute_hash没有prefix导致的错误情况
         """
         assert not seq.block_table, "序列已经被分配过块，不能重复分配"
-        cache_miss = False
+        cache_miss = False # 默认当前的seq的kv访存未命中
+
+        # 新增：用于在循环中传递前一个块的哈希值
+        prefix_hash = -1
+
         for i in range(seq.num_blocks):
             token_ids = seq.get_token_ids_from_block(i)
             # 只有当块是满的时候才计算哈希并尝试缓存
-            h = self.compute_hash(token_ids) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
+            h = self.compute_hash(token_ids, prefix=prefix_hash) if len(token_ids) == self.block_size else -1
+            block_id = self.hash_to_block_id.get(h, -1) # 查找对应键的值，如果没有则返回-1
             
             # 检查缓存是否命中
             # 条件1: 哈希值不存在于缓存中 (block_id == -1)
-            # 条件2: 哈希冲突，虽然哈希值相同，但实际的token内容不同
+            # 条件2: 哈希冲突，虽然哈希值相同，但实际的token内容不同, 发生概率极低，但是仍然有可能发生
             # 条件3: 一旦发生cache_miss，后续所有块都必须重新分配，即使它们可能在缓存中
             if cache_miss or block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
                 # 缓存未命中，从空闲列表中分配一个新块
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
-                if h != -1: # 如果块是满的，更新其内容和哈希，并加入缓存
+                if h != -1: # 如果块是满的，更新其内容和哈希，并加入缓存,块不满则不需要计算哈希和更新block的token ids，因为未满的block的token ids一定是最后一个block，token ids可以计算出来
                     block.update(h, token_ids)
                     self.hash_to_block_id[h] = block_id
             else:
@@ -146,6 +151,16 @@ class BlockManager:
             
             # 将分配的或复用的块ID添加到序列的块表中
             seq.block_table.append(block_id)
+
+            # 新增：更新下一次循环的prefix_hash
+            # 只有当块是满的时候，它的哈希才有意义成为下一个块的前缀
+            if h != -1:
+                prefix_hash = h
+            else:
+                # 如果当前块不是满的（通常是序列最后一个块）
+                # 那么它没有有效的哈希，后续也没有块
+                break
+
 
     def deallocate(self, seq: Sequence):
         """

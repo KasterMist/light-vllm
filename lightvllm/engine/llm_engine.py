@@ -78,7 +78,7 @@ class LLMEngine:
         # 初始化调度器，负责管理请求队列和批处理逻辑
         self.scheduler = Scheduler(config)
         
-        # 注册退出时的清理函数，确保资源正确释放
+        # 注册退出时的清理函数，确保资源正确释放,防止因为创建多个子进程由于主进程意外退出导致没有正确的通知子进程也推出从而引发资源泄漏的问题
         atexit.register(self.exit)
     
     def exit(self):
@@ -225,7 +225,7 @@ class LLMEngine:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         
-        # 标准化采样参数：如果不是列表，则复制给每个prompt使用
+        # 标准化采样参数：如果不是列表，则复制给每个prompt使用, 使每个prompt都有对应的采样参数
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         
@@ -245,7 +245,7 @@ class LLMEngine:
             # 执行一次推理步骤
             output, num_tokens = self.step()
             
-            # 更新吞吐量统计并显示进度
+            # 更新吞吐量统计并显示进度 TODO: 添加平均token处理速度
             if use_tqdm:
                 if num_tokens > 0:
                     # 正数表示prefill阶段，计算输入token处理速度

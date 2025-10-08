@@ -42,10 +42,10 @@ class ModelRunner:
         """
         self.config = config
         hf_config = config.hf_config
-        self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
+        self.block_size = config.kvcache_block_size     # PagedAttention中每个KV缓存块（block）的大小（以token数量计）。
+        self.enforce_eager = config.enforce_eager       # 是否强制使用Eager模式，禁用CUDA Graphs
+        self.world_size = config.tensor_parallel_size   # 张量并行的大小，即使用的GPU数量。例如，设置为2表示使用2张GPU进行张量并行。
+        self.rank = rank    # 当前进程在分布式环境中的rank值
         self.event = event
 
         # 1. 初始化分布式环境
@@ -218,11 +218,15 @@ class ModelRunner:
         
         # 计算每个GPU上的KV头数量
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        # 计算一个KV缓存块的大小（字节）
+        # 计算一个KV缓存块的大小（字节）,包含了所有的层占用的大小
         block_bytes = (2 * hf_config.num_hidden_layers * self.block_size * 
                        num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize)
                        
         # 计算可分配的块数
+        # 计算可用于KV缓存的显存。
+        # 公式: (总预算) - (当前已用) - (推理时激活值等临时显存占用)
+        # 其中，(推理时临时显存) 通过 (预热峰值 - 预热后稳定值) 来估算。
+        # 这种方式可以精确地为KV缓存预留出最大空间，同时保证运行时不会因激活值而OOM。
         available_memory = total * config.gpu_memory_utilization - used - peak + current
         config.num_kvcache_blocks = int(available_memory) // block_bytes
         assert config.num_kvcache_blocks > 0, "Not enough memory for KV cache"
