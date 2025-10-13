@@ -105,7 +105,7 @@ class Scheduler:
                     # 如果运行队列已空，只能抢占当前序列自身
                     self.preempt(seq)
                     break # 跳出内层while循环
-            else:
+            else: # 正常结束while循环才会执行else
                 # 如果可以追加（或抢占后可以追加）
                 num_seqs += 1
                 self.block_manager.may_append(seq) # 预留一个块的空间

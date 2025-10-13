@@ -112,54 +112,42 @@ class BlockManager:
         为一个序列分配所需的KV缓存块。
         这个函数只在序列第一次被调度（prefill阶段）时调用一次。
         它会尝试利用前缀缓存来复用已有的块。
-        TODO: 避免prefill阶段compute_hash没有prefix导致的错误情况
+        Done: 避免prefill阶段compute_hash没有prefix导致的错误情况
         """
         assert not seq.block_table, "序列已经被分配过块，不能重复分配"
         cache_miss = False # 默认当前的seq的kv访存未命中
 
         # 新增：用于在循环中传递前一个块的哈希值
-        prefix_hash = -1
+        h = -1
 
         for i in range(seq.num_blocks):
             token_ids = seq.get_token_ids_from_block(i)
             # 只有当块是满的时候才计算哈希并尝试缓存
-            h = self.compute_hash(token_ids, prefix=prefix_hash) if len(token_ids) == self.block_size else -1
+            h = self.compute_hash(token_ids, prefix=h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1) # 查找对应键的值，如果没有则返回-1
             
-            # 检查缓存是否命中
-            # 条件1: 哈希值不存在于缓存中 (block_id == -1)
-            # 条件2: 哈希冲突，虽然哈希值相同，但实际的token内容不同, 发生概率极低，但是仍然有可能发生
-            # 条件3: 一旦发生cache_miss，后续所有块都必须重新分配，即使它们可能在缓存中
-            if cache_miss or block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
+            if cache_miss:
                 # 缓存未命中，从空闲列表中分配一个新块
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
-                if h != -1: # 如果块是满的，更新其内容和哈希，并加入缓存,块不满则不需要计算哈希和更新block的token ids，因为未满的block的token ids一定是最后一个block，token ids可以计算出来
-                    block.update(h, token_ids)
-                    self.hash_to_block_id[h] = block_id
             else:
                 # 缓存命中
                 seq.num_cached_tokens += self.block_size
-                block = self.blocks[block_id]
                 if block_id in self.used_block_ids:
                     # 如果命中的块当前正在被使用，增加其引用计数
+                    block = self.blocks[block_id]
                     block.ref_count += 1
                 else:
                     # 如果命中的块当前是空闲的（例如，之前被释放了），则重新分配它
-                    self._allocate_block(block_id)
-            
+                    block = self._allocate_block(block_id)
+            if h != -1: # 如果块是满的，更新其内容和哈希，并加入缓存,块不满则不需要计算哈希和更新block的token ids，因为未满的block的token ids一定是最后一个block，token ids可以计算出来
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
             # 将分配的或复用的块ID添加到序列的块表中
             seq.block_table.append(block_id)
 
-            # 新增：更新下一次循环的prefix_hash
-            # 只有当块是满的时候，它的哈希才有意义成为下一个块的前缀
-            if h != -1:
-                prefix_hash = h
-            else:
-                # 如果当前块不是满的（通常是序列最后一个块）
-                # 那么它没有有效的哈希，后续也没有块
-                break
 
 
     def deallocate(self, seq: Sequence):
@@ -201,18 +189,17 @@ class BlockManager:
         block_table = seq.block_table 
         last_block = self.blocks[block_table[-1]]
         
-        # 场景1: 当前序列的最后一个逻辑块已满，下一个token需要一个新的物理块。
-        if len(seq) % self.block_size == 0:
+        # 场景1: 当前序列的最后一个逻辑块已满，并且多出一个token需要新的物理块。
+        if len(seq) % self.block_size == 1:
             # 此时，刚刚被填满的那个块的哈希值应该已经被计算和缓存了。
             assert last_block.hash != -1, "一个刚被填满的块应该有哈希值"
             # 分配一个新块
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
-        # 场景2: 当前序列的最后一个逻辑块即将被填满（只差一个token）。
-        elif (len(seq) + 1) % self.block_size == 0:
-            # 最后一个块在追加这个新token后就会被填满。
-            # 我们现在就可以计算它的哈希并更新缓存。
+        # 场景2: 当前序列的最后一个逻辑块填刚好填满
+        elif len(seq) % self.block_size == 0:
+            # 此时可以计算它的哈希并更新缓存。
             assert last_block.hash == -1, "一个未满的块不应该有哈希值"
             # 获取这个即将被填满的块的所有token
             token_ids = seq.get_token_ids_from_block(seq.num_blocks - 1)
@@ -222,7 +209,7 @@ class BlockManager:
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
         else:
-            # 场景3: 新的token被追加到最后一个块，但该块仍未满。
+            # 场景3: 最后一个块未满，且token数量不为1
             # 在这种情况下，我们不需要做任何操作，因为块还未满，无需计算哈希。
             assert last_block.hash == -1, "一个未满的块不应该有哈希值"
 

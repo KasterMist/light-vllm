@@ -1,0 +1,1 @@
+from lightvllm.kernels.cuda_kernels.activation import silu_and_mul as cuda_swiglu

@@ -24,9 +24,12 @@ class Config:
     num_kvcache_blocks: int = -1                # KV缓存的总块数。如果为-1（默认），则会根据gpu_memory_utilization自动计算。如果设置为具体数值，则会使用该值。
 
     # --- 杂项配置 ---
-    enforce_eager: bool = False                 # 是否强制使用Eager模式，禁用CUDA Graphs。CUDA Graphs可以优化decode阶段的性能，但不利于调试。开启此选项主要用于调试目的。
+    enforce_eager: bool = True                 # 是否强制使用Eager模式，禁用CUDA Graphs。CUDA Graphs可以优化decode阶段的性能，但不利于调试。开启此选项主要用于调试目的。
     hf_config: AutoConfig | None = None         # HuggingFace的模型配置对象（transformers.AutoConfig），将在__post_init__中根据模型路径自动加载。
     eos: int = -1                               # 序列结束符（End-of-Sequence）的token ID。-1表示尚未设置，后续将由Tokenizer自动设置。
+
+    # 算子选择
+    kernel_backend: str = "native"              # 使用的算子后端。可选值包括 "native"（默认）, "triton" 和 "cuda"。不同后端在性能和兼容性上有所不同。
 
     def __post_init__(self):
         """

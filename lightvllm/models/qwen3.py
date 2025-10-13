@@ -125,6 +125,7 @@ class Qwen3MLP(nn.Module):
 
     def __init__(
         self,
+        config: Qwen3Config,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
@@ -134,6 +135,7 @@ class Qwen3MLP(nn.Module):
         # 这里，它同时计算gate和up的投影。
         # 输入: [num_tokens, hidden_size]
         # 输出: [num_tokens, 2 * intermediate_size]
+        self.config = config
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -147,7 +149,7 @@ class Qwen3MLP(nn.Module):
         )
         assert hidden_act == "silu", "Qwen3 MLP只支持silu激活函数"
         # SiluAndMul实现了SwiGLU激活函数: SiLU(gate) * up
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(config.kernel_backend)
 
     def forward(self, x):
         # x: [num_tokens, hidden_size]
@@ -175,6 +177,8 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config
     ):
         super().__init__()
+        self.config = config
+        self.kernel_backend = config.kernel_backend
         # 自注意力模块
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
@@ -189,6 +193,7 @@ class Qwen3DecoderLayer(nn.Module):
         )
         # MLP模块
         self.mlp = Qwen3MLP(
+            config=self.config,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act
@@ -241,6 +246,7 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config
     ):
         super().__init__()
+        self.kernel_backend = config.kernel_backend
         # 词嵌入层，支持词汇表并行（当tp_size > 1时，词汇表会被切分）
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -293,9 +299,12 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen3Config,
     ):
         super().__init__()
+        # 选择不同的算子后端（native, triton, cuda）
+        assert config.kernel_backend in ["native", "triton", "cuda"], f"不支持的kernel_backend: {kernel_backend}"
+        self.kernel_backend = config.kernel_backend
         # 核心模型
         self.model = Qwen3Model(config)
         # 语言模型头部，用于将模型输出映射到词汇表上

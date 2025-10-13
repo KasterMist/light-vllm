@@ -24,7 +24,7 @@ class Sequence:
     
     每个Sequence对象代表一个从prompt开始的文本生成任务。
     """
-    # KV缓存块的大小，这是一个固定的类属性，与调度器和模型运行器中的设置保持一致。
+    # KV缓存块的大小，这是一个固定的类属性，必须与调度器和模型运行器中的设置保持一致。
     block_size = 256
     # 一个全局计数器，用于为每个新创建的Sequence实例分配一个唯一的ID。
     # 这使得我们可以在整个系统中唯一地标识和追踪每个请求。
@@ -59,7 +59,7 @@ class Sequence:
         self.block_table: list[int] = []
         # 从采样参数中提取的配置
         self.temperature = sampling_params.temperature
-        # TODO: 这个好像是在prompt之后生成的最大token数量, 默认是128, 可后续修改，需要确认
+        # prompt之后生成的最大token数量, 默认是128, 可后续修改
         self.max_tokens = sampling_params.max_tokens 
         self.ignore_eos = sampling_params.ignore_eos
 

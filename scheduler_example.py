@@ -20,6 +20,19 @@ if __name__ == "__main__":
         "who are you?",
         "list all prime numbers within 100",
     ]
+    # prompts[0]: '<|im_start|>user\nintroduce yourself<|im_end|>\n<|im_start|>assistant\n'
+    #   <|im_start|>  151644  
+    #     user        872    
+    #     \n           198
+    #    int          396
+    #    roduce       47845
+    #     yourself    6133
+    #    <|im_end|>   151634
+    #    \n           198
+    #    <|im_start|>  151644
+    #    assistant    77091
+    #    \n           198
+
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

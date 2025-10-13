@@ -237,6 +237,12 @@ class LLMEngine:
         outputs = {}  # 用seq_id作为key收集完成的输出
         prefill_throughput = decode_throughput = 0.0  # 两阶段的吞吐量统计
         
+        # 初始化用于计算平均速度的变量
+        total_prefill_tokens = 0
+        total_prefill_time = 0.0
+        total_decode_tokens = 0
+        total_decode_time = 0.0
+        
         # 主循环：持续执行推理步骤直到所有请求完成
         while not self.is_finished():
             # 记录步骤开始时间，用于计算吞吐量
@@ -244,15 +250,20 @@ class LLMEngine:
             
             # 执行一次推理步骤
             output, num_tokens = self.step()
+            step_time = perf_counter() - t
             
-            # 更新吞吐量统计并显示进度 TODO: 添加平均token处理速度
+            # 更新吞吐量统计并显示进度
             if use_tqdm:
                 if num_tokens > 0:
-                    # 正数表示prefill阶段，计算输入token处理速度
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    # num_tokens > 0 表示prefill 阶段
+                    prefill_throughput = num_tokens / step_time
+                    total_prefill_tokens += num_tokens
+                    total_prefill_time += step_time
                 else:
-                    # 负数表示decode阶段，计算生成token的速度
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    # num_tokens < 0 表示decode 阶段
+                    decode_throughput = -num_tokens / step_time
+                    total_decode_tokens += -num_tokens
+                    total_decode_time += step_time
                 
                 # 更新进度条显示当前吞吐量
                 pbar.set_postfix({
@@ -276,6 +287,12 @@ class LLMEngine:
         # 关闭进度条
         if use_tqdm:
             pbar.close()
+        
+        # 计算并打印最终的平均速度
+        avg_prefill_speed = total_prefill_tokens / total_prefill_time if total_prefill_time > 0 else 0
+        avg_decode_speed = total_decode_tokens / total_decode_time if total_decode_time > 0 else 0
+        print(f"Avg Prefill Speed: {avg_prefill_speed:.2f} tokens/s")
+        print(f"Avg Decode Speed: {avg_decode_speed:.2f} tokens/s")
             
         return outputs
 

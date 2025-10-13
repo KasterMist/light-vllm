@@ -41,7 +41,9 @@ class ModelRunner:
                                          - rank > 0: 接收单个事件，用于接收主进程的通知。
         """
         self.config = config
+        self.kernel_backend = config.kernel_backend  # 使用的算子后端
         hf_config = config.hf_config
+        hf_config.kernel_backend = self.kernel_backend
         self.block_size = config.kvcache_block_size     # PagedAttention中每个KV缓存块（block）的大小（以token数量计）。
         self.enforce_eager = config.enforce_eager       # 是否强制使用Eager模式，禁用CUDA Graphs
         self.world_size = config.tensor_parallel_size   # 张量并行的大小，即使用的GPU数量。例如，设置为2表示使用2张GPU进行张量并行。
@@ -66,6 +68,7 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
+            print("Capturing CUDA Graphs...")
             self.capture_cudagraph()
             
         # 5. 恢复默认设备和数据类型
