@@ -1,9 +1,19 @@
-#ifndef DISPATCH_MACROS_H
-#define DISPATCH_MACROS_H
+#ifndef UTILS
+#define UTILS
 
 #include <ATen/ATen.h>
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
+
+#define WARP_SIZE 32
+// 向上取整
+#define CEIL(a, b) (a + b - 1) / b
+
+#define INT4(value) (reinterpret_cast<int4*>(&(value))[0])
+#define FLOAT4(value) (reinterpret_cast<float4>(&(value))[0])
+#define HALF2(value) (reinterpret_cast<half2*>(&(value))[0])
+#define BFLOAT2(value) (reinterpret_cast<__nv_bfloat162*>(&(value))[0])
+#define LDST128BITS(value) (reinterpret_cast<float4*>(&(value))[0])
 
 // 定义 AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BF16 宏
 #ifndef AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BF16
@@ -34,4 +44,4 @@
   }()
 #endif
 
-#endif // DISPATCH_MACROS_H
+#endif // UTILS

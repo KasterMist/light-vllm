@@ -3,7 +3,7 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include "dispatch_macros.h"
+#include "utils.h"
 
 // 为不支持 bfloat16 的旧架构（< SM80）提供一个简单的 sigmoid 实现
 // 注意：这只是一个示例，实际生产中可能需要更精确的实现

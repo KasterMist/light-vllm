@@ -1,3 +1,3 @@
 from lightvllm.kernels.triton_kernels.activation import swiglu as triton_swiglu
-from lightvllm.kernels.triton_kernels.softmax import naive_softmax_forward as triton_naive_softmax
+from lightvllm.kernels.triton_kernels.softmax import softmax_forward as triton_softmax
 from lightvllm.kernels.triton_kernels.softmax import online_softmax_forward as triton_online_softmax

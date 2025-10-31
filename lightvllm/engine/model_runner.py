@@ -66,6 +66,7 @@ class ModelRunner:
         
         # 4. 模型预热、分配KV缓存、捕获CUDA Graph
         self.warmup_model()
+        # 开辟足量kv缓存，默认值全部为0，对模型的每个包含k_cache和v_cache属性的层进行kv缓存的映射
         self.allocate_kv_cache()
         if not self.enforce_eager:
             print("Capturing CUDA Graphs...")
@@ -269,20 +270,42 @@ class ModelRunner:
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """
-        为prefill（预填充）阶段准备模型输入。
-        
-        Prefill阶段处理每个请求的初始prompt。由于每个prompt长度不同，
-        需要将它们拼接成一个大的批次，并提供相应的元数据。
-        
+        为 Prefill（预填充 Prompt）阶段准备一次前向所需的张量与上下文元数据。
+
+        设计背景：
+        - Prefill 需要把多个不同长度的 prompt 合并成一个大批次进行计算（提升吞吐）。
+        - 同时，Attention 与 KV Cache（PagedAttention）需要知道每个 token 对应的“位置”和“在缓存中的槽位”。
+        - 因为可能命中了“前缀缓存”（prefix caching），部分前缀 token 已经在 KV Cache 中，无需重复计算；本次仅计算未缓存部分。
+
+        本函数完成两件事：
+        1) 组装模型直观输入
+                - input_ids: 把所有序列“未缓存”的 token 串接成一维数组，便于一次性送入模型。
+                - positions: 每个 token 在其各自序列中的位置（从 0 开始递增），与 input_ids 对齐。
+
+        2) 组装并设置全局上下文（供模型各层使用，见 utils/context.py）
+                - cu_seqlens_q(cu代表accumulate): Query 端每个序列的累积长度（只包含未缓存的 token，因本次只计算这些 token 的 Q）。
+                - cu_seqlens_k: Key 端每个序列的累积长度（包含全部 token：已缓存 + 未缓存）。
+                - max_seqlen_q / max_seqlen_k: 以上两者在当前批次的最大值（供 FlashAttention 等内核优化）。
+                - slot_mapping: 为“未缓存”的每个 token 给出它在 KV Cache 中应该写入的物理槽位（block_id * block_size + offset）。
+                    注：如果一个序列前缀命中缓存，则这些已缓存 token 不会出现在 slot_mapping 中，本次也不会写入它们。
+                - block_tables: 若存在前缀缓存（即 K 的总长度 > 本次 Q 的总长度），需传入每个序列的块表，
+                    以便 Attention 在读取 KV 时能通过块表找到历史 token 所在的物理块。
+
+        举例：
+        - 假设 block_size=4，有两条序列：
+            seq0: token_ids=[10,11,12,13,14]；其中前 4 个已缓存（命中前缀缓存），未缓存部分为 [14]
+            seq1: token_ids=[20,21]；全部未缓存
+        - 则：
+            input_ids = [14, 20, 21]
+            positions = [4, 0, 1]  # 每个 token 在各自序列中的位置
+            cu_seqlens_q = [0, 1, 3]  # 本次 Q 的累计长度（seq0 本次 1 个，seq1 本次 2 个）
+            cu_seqlens_k = [0, 5, 7]  # K 端累计长度（seq0 全长5，seq1 全长2）
+            slot_mapping: 为 3 个未缓存 token 计算它们在 KV 的目标槽位；
+            block_tables: 因存在缓存（K 总长 > Q 总长），需传入两条序列的块表，便于读取历史 KV。
+
         返回：
-            - input_ids: 所有序列的待处理token拼接成的一维张量。
-            - positions: 对应的位置ID。
-        
-        同时，通过`set_context`设置全局上下文，包含：
-            - cu_seqlens_q/k: 累积序列长度，用于FlashAttention。
-            - max_seqlen_q/k: Q和K的最大序列长度。
-            - slot_mapping: 将每个token映射到其在KV缓存中的具体位置（slot）。
-            - block_tables: 如果有前缀缓存，则提供块表。
+                - input_ids(torch.int64): 拼接后的未缓存 token。
+                - positions(torch.int64): 对应的序列内位置。
         """
         input_ids = []
         positions = []
@@ -309,16 +332,40 @@ class ModelRunner:
             if not seq.block_table:
                 continue
             
-            # 计算新token的slot mapping
+            # 计算新 token 的 slot mapping（把“逻辑位置”映射到 KV Cache 的“物理槽位”）。
+            #
+            # 背景：PagedAttention 将 KV Cache 划分为固定大小的物理块（block），
+            # 每个序列维护一个 block_table = [b0, b1, b2, ...]，表示该序列数据对应到哪些物理块。
+            # 对于第 i 个逻辑块（0-based），其在物理缓存中的起始槽位 = block_id * block_size。
+            #
+            # 目标：为“本次需要写入的所有 token”（未缓存）生成它们应该写入的物理槽位索引，
+            # 这些索引拼起来构成一维数组 slot_mapping，模型前向时据此把 K/V 写到正确位置。
+            #
+            # 遍历范围：从 seq.num_cached_blocks 到 seq.num_blocks-1
+            # - 前缀缓存命中的整块（前 seq.num_cached_blocks 个逻辑块）已经存在于 KV 中，无需本步写入，不计入 slot_mapping。
+            # - 之后的块要么是“中间的满块”，要么是“最后一个未满块”。两者都需要把其对应的槽位范围加入 slot_mapping。
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
+                    # 最后一个逻辑块可能未满，仅有 last_block_num_tokens 个有效 token。
+                    # 只为这些有效 token 预留槽位，不为 padding 生成槽位。
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
+
+            # 例子：
+            # 假设 block_size = 4，某序列的 block_table = [5, 7, 9]，表示该序列用到物理块 5、7、9。
+            # - 若该序列已有 1 个整块命中缓存（num_cached_blocks=1），则：
+            #   i 从 1 开始：
+            #   i=1（第二个逻辑块，物理块 7）是满块 → 槽位范围 [7*4, 7*4+4) = [28, 32)
+            #   i=2（第三个逻辑块，物理块 9）是最后一个块，假设 last_block_num_tokens=2 → 槽位范围 [9*4, 9*4+2) = [36, 38)
+            #   因此本序列贡献 slot_mapping 片段为 [28, 29, 30, 31, 36, 37]
+            # - 多个序列时，所有序列的片段顺序拼接，得到整体的一维 slot_mapping。模型前向会按此顺序把“本次未缓存的所有 token”的 KV 写入。
                 
         # 如果存在前缀缓存（即K的长度大于Q的长度），则需要提供block_tables
+        # block_tables是一个二维张量，每一行对应一个序列，行中的每个元素是该序列使用的KV缓存块的索引。
+        # 所有行的长度会填充到与最长序列一致，填充值为-1
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
             

@@ -70,7 +70,7 @@ class RMSNorm(nn.Module):
         # 为了数值稳定性，将 x 和 residual 都转换为 float32 进行相加。
         x = x.to(torch.float32).add_(residual.to(torch.float32))
         # 将相加后的结果保存为新的残差，它将作为下一层的输入残差。
-        residual = x.to(origin_dtype)
+        residual = x.to(origin_dtype).clone()  # 显式克隆以避免浅拷贝问题
         # 计算 x 的平方的均值（方差）。
         var = x.pow(2).mean(-1, True)
         # 执行 RMS 归一化。

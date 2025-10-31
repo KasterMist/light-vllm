@@ -19,21 +19,51 @@ def naive_softmax_kernel(
     x_ptr += program_id * row_stride
     y_ptr += program_id * row_stride
 
-    # 默写下方实现的代码
     # 计算当前线程块处理的列索引范围
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
 
-    # 向量化加载数据
-    x_row = tl.load(x_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    # 向量化加载数据；越界位置填充 -inf 避免影响 max/sum
+    x_row = tl.load(x_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
 
     # 计算softmax
-    x_max = tl.maximum(x_row, axis=1, keepdims=True)
+    x_max = tl.max(x_row, 0)
     x_row = tl.exp(x_row - x_max)
-    x_row_sum = tl.sum(x_row, axis=1, keepdims=True)
+    x_row_sum = tl.sum(x_row, 0)
     y_row = x_row / x_row_sum
 
     tl.store(y_ptr + col_offsets, y_row, mask=mask)
+
+
+@triton.jit
+def softmax_kernel(
+    output_ptr,
+    input_ptr,
+    input_row_stride,
+    row_size,
+    col_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0) # row start idx
+    programs_size = tl.num_programs(0) # total number of programs, also the row steps for range
+
+    for row_idx in tl.range(pid, row_size, programs_size):
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < col_size
+
+        input_vals = tl.load(row_start_ptr + col_offsets, mask=mask, other=-float('inf')).to(tl.float32)
+        minus_max = input_vals - tl.max(input_vals, axis=0)
+        exp_minus_max = tl.exp(minus_max)
+
+        exp_sum = tl.sum(exp_minus_max, axis=0)
+
+        softmax_outputs = exp_minus_max / exp_sum
+
+        output_row_start_ptr = output_ptr + row_idx * input_row_stride
+        
+        tl.store(output_row_start_ptr + col_offsets, softmax_outputs, mask=mask)
+
 
 
 @triton.jit
@@ -188,15 +218,17 @@ def online_softmax_forward(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def naive_softmax_forward(x: torch.Tensor) -> torch.Tensor:
+def softmax_forward(x: torch.Tensor) -> torch.Tensor:
     y = torch.empty_like(x, dtype=x.dtype)
     n_rows, n_cols = x.shape
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
-    naive_softmax_kernel[(n_rows,)](
-        x_ptr=x,
-        y_ptr=y,
-        row_stride=n_cols,
-        n_cols=n_cols,
+    
+    softmax_kernel[(n_rows // 2,)](
+        output_ptr=y,
+        input_ptr=x,
+        input_row_stride=x.stride(0),
+        row_size=n_rows,
+        col_size=n_cols,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=num_warps,
     )

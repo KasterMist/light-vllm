@@ -51,34 +51,61 @@ def store_kvcache_kernel(
     tl.store(k_cache_ptr + cache_offsets, key)
     tl.store(v_cache_ptr + cache_offsets, value)
 
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, 
-                    v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+def store_kvcache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
     """
-    一个Python包装函数，用于调用上面的Triton内核。
-    它负责准备参数并启动内核。
-    
+    将“本步新产生（未缓存）的 token”的 K/V 写入到全局 KV 缓存（PagedAttention 的物理缓存）中。
+
+    核心要点：
+    - 写入哪些 KV：仅写入当前批次需要新增的 token（未命中前缀缓存的部分）的 K/V；历史（已缓存）的 KV 不会在本函数中重复写入。
+    - 写到哪里：通过 slot_mapping 将“逻辑上的第 i 个 token”映射到“物理缓存的第 slot 行”。
+      每个 slot 对应一个扁平槽位，覆盖 num_kv_heads * head_dim 个连续元素（记作 D）。
+      实际写入地址范围是 [slot * D, slot * D + D)。
+    - 如何计算 slot_mapping：由调度/准备阶段（如 prepare_prefill）依据 block_table（每个逻辑块映射到哪个物理块）
+      和块内偏移（offset）生成。公式上可理解为 slot = block_id * block_size + offset。
+
+    张量约定：
+    - key/value: [N, num_kv_heads, head_dim]，N 是“本步需要写入的 token 总数”（所有序列合并后）。
+    - k_cache/v_cache: 视图为 [max_slots, D] 的二维张量，其中 D = num_kv_heads * head_dim；
+      在本项目中，注意力层通常会将其内存布局保证为该视图可用（或通过 stride 满足第二维跨度为 D）。
+    - slot_mapping: [N] 的一维整型张量，slot_mapping[i] 给出第 i 个 token 的目标物理槽位。
+
+    性能与并行：
+    - 我们使用 Triton JIT 内核为每个 token 启动一个并行程序（grid = (N,)），实现逐 token 的并行写入。
+
     Args:
-        key (torch.Tensor): 当前批次计算出的K向量，维度 [num_tokens, num_kv_heads, head_dim]。
-        value (torch.Tensor): 当前批次计算出的V向量，维度 [num_tokens, num_kv_heads, head_dim]。
-        k_cache (torch.Tensor): 整个物理K缓存，维度 [max_slots, num_kv_heads * head_dim]。
-        v_cache (torch.Tensor): 整个物理V缓存，维度 [max_slots, num_kv_heads * head_dim]。
-        slot_mapping (torch.Tensor): 槽位映射表，维度 [num_tokens]。
+        key (torch.Tensor): 当前批次“未缓存 token”的 K，形状 [N, num_kv_heads, head_dim]。
+        value (torch.Tensor): 当前批次“未缓存 token”的 V，形状 [N, num_kv_heads, head_dim]。
+        k_cache (torch.Tensor): 全局物理 K 缓存（按 slot 扁平化视图）[max_slots, D]。
+        v_cache (torch.Tensor): 全局物理 V 缓存（按 slot 扁平化视图）[max_slots, D]。
+        slot_mapping (torch.Tensor): 逻辑 token → 物理槽位的映射，形状 [N]。
     """
-    # key/value 维度: [N, num_heads, head_dim], N是批次中的token总数
-    # k_cache/v_cache 维度: [max_slots, D], max_slots是最大可用存储槽位数
-    # slot_mapping 维度: [N]
+    # 形状速记：key/value 为 [N, num_kv_heads, head_dim]，N 是“本步要写入”的 token 数；
+    # k_cache/v_cache 为 [max_slots, D] 的视图，其中 D = num_kv_heads * head_dim；slot_mapping 为 [N]。
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
-    
-    # 一些断言，确保张量的内存布局是连续的，以获得最佳性能
+
+    # 断言：确保内存布局满足内核假设（提高带宽利用效率）。
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    
-    # 启动Triton内核。grid参数 (N,) 表示启动N个并行实例，每个实例处理一个token。
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0),
-                                k_cache, v_cache, slot_mapping, D)
+
+    # 启动 Triton 内核：grid=(N,) 表示每个 token 启动一个并行程序。
+    # 对于第 idx 个 token：
+    #   - 读取 key[idx, :, :] / value[idx, :, :]
+    #   - 计算 slot = slot_mapping[idx]
+    #   - 将该 token 的 K/V 写入到 k_cache[slot, :] / v_cache[slot, :] （长度为 D 的连续内存）
+    store_kvcache_kernel[(N,)](
+        key, key.stride(0),
+        value, value.stride(0),
+        k_cache, v_cache, slot_mapping, D
+    )
 
 # GQA: Group Query Attention
 class Attention(nn.Module):
@@ -118,7 +145,7 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         
-        # 如果KV缓存已经分配，则将当前计算出的K和V存入缓存
+        # 如果KV缓存已经分配，则将当前计算出的K和V存入缓存。这一步会用slot_mapping把“本次需要写入的 token”对应的 K/V 值写进物理缓存的正确槽位
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         

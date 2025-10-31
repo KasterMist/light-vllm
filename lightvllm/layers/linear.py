@@ -260,16 +260,16 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
     ):
-        self.head_size = head_size
-        self.total_num_heads = total_num_heads
+        self.head_size = head_size  # 128
+        self.total_num_heads = total_num_heads # 16
         # 如果未指定KV头数，则默认为与Q头数相同 (MHA)
-        self.total_num_kv_heads = total_num_kv_heads or total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads or total_num_heads # 8
         tp_size = dist.get_world_size()
         # 计算每个GPU上的头数
         self.num_heads = divide(self.total_num_heads, tp_size)
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = hidden_size
-        # 总输出大小 = (Q总头数 + K总头数 + V总头数) * head_size
+        # 总输出大小 = (Q总头数 + K总头数 + V总头数) * head_size = (16 + 8 + 8) * 128 = 4096
         output_size = (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_size
         super().__init__(input_size, output_size, bias)
 

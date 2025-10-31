@@ -51,10 +51,10 @@ class Qwen3Attention(nn.Module):
         # --- 层定义 ---
         # QKV的并行线性层。它将Q、K、V的投影矩阵合并，并沿列（hidden_size）切分，分发到不同GPU上。
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            hidden_size, # 1024
+            self.head_dim, # 128
+            self.total_num_heads, # 16
+            self.total_num_kv_heads, # 8
             bias=qkv_bias,
         )
         # 输出投影层。它将多头注意力的结果合并，并进行线性变换。
@@ -90,7 +90,7 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         # hidden_states: [num_tokens, hidden_size]
         
-        # 1. QKV投影
+        # 1. QKV投影，根据词嵌入生成的token对应的向量，生成q k v
         qkv = self.qkv_proj(hidden_states)  # -> [num_tokens, q_size + 2 * kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # q: [num_tokens, q_size], k: [num_tokens, kv_size], v: [num_tokens, kv_size]
@@ -267,7 +267,7 @@ class Qwen3Model(nn.Module):
         # input_ids: [num_tokens]
         # positions: [num_tokens]
         
-        # 1. 词嵌入
+        # 1. 词嵌入, 将token值扩展到隐藏维度 input_ids: [num_tokens] -> hidden_states: [num_tokens, hidden_size]
         hidden_states = self.embed_tokens(input_ids) # -> [num_tokens, hidden_size]
         residual = None
         
